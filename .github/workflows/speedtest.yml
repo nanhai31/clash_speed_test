@@ -1,0 +1,162 @@
+# This is a basic workflow to help you get started with Actions
+name: Clash Node Speed Test
+
+on:
+  schedule:
+    # 每天北京时间 凌晨2点运行 (UTC 18:00)
+    - cron: '0 18 * * *'
+  
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      max_latency:
+        description: '最大延迟阈值 (毫秒)'
+        required: false
+        default: '500'
+        type: string
+      top_n:
+        description: '保留前N个最快节点 (留空保留所有)'
+        required: false
+        default: ''
+        type: string
+      use_http:
+        description: '使用HTTP测试 (更准确)'
+        required: false
+        default: true
+        type: boolean
+      test_url:
+        description: '测试用的URL'
+        required: false
+        default: 'http://www.google.com/generate_204'
+        type: string
+
+# 设置权限
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements.txt
+      
+      - name: 运行测速脚本
+        env:
+          CONFIG_URL: ${{ secrets.CONFIG_URL || 'https://127.0.0.1/github/config.yaml' }}
+          MAX_LATENCY: ${{ github.event.inputs.max_latency || '500' }}
+          TOP_N: ${{ github.event.inputs.top_n || '' }}
+          MAX_WORKERS: '20'
+          OUTPUT_PATH: 'config/fast_config.yaml'
+          USE_HTTP: ${{ github.event.inputs.use_http || 'true' }}
+          TEST_URL: ${{ github.event.inputs.test_url || 'http://www.google.com/generate_204' }}
+        run: |
+          cd src
+          python speedtest.py
+      
+      - name: 检查是否有变更
+        id: check_changes
+        run: |
+          if [[ -n $(git status --porcelain config/) ]]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "检测到配置文件变更"
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "无配置文件变更"
+          fi
+      
+      - name: 生成更新日志
+        if: steps.check_changes.outputs.changes == 'true'
+        run: |
+          echo "## 更新日志 $(date '+%Y-%m-%d %H:%M:%S UTC')" > UPDATE_LOG.md
+          echo "" >> UPDATE_LOG.md
+          echo "### 配置信息" >> UPDATE_LOG.md
+          echo "- 源配置: ${{ secrets.CONFIG_URL || 'https://127.0.0.1/github/config.yaml' }}" >> UPDATE_LOG.md
+          echo "- 最大延迟: ${{ github.event.inputs.max_latency || '500' }}ms" >> UPDATE_LOG.md
+          echo "- 测试模式: ${{ github.event.inputs.use_http || 'true' }}" >> UPDATE_LOG.md
+          echo "" >> UPDATE_LOG.md
+          
+          if [ -f config/fast_config_stats.json ]; then
+            echo "### 统计信息" >> UPDATE_LOG.md
+            cat config/fast_config_stats.json | jq -r '
+              "|- 节点总数: \(.total_nodes)",
+              "|- 最大延迟: \(.max_latency)ms",
+              "|- 更新时间: \(.timestamp)"
+            ' >> UPDATE_LOG.md
+          fi
+          
+          echo "" >> UPDATE_LOG.md
+          echo "### 最近提交" >> UPDATE_LOG.md
+          git log -5 --pretty=format:"- %h %s (%ad)" --date=short >> UPDATE_LOG.md
+      
+      - name: 提交并推送变更
+        if: steps.check_changes.outputs.changes == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add config/
+          git commit -m "🚀 自动更新Clash配置 $(date '+%Y-%m-%d %H:%M:%S')"
+          git push
+      
+      - name: 上传配置文件 (Artifact)
+        uses: actions/upload-artifact@v3
+        with:
+          name: clash-config-${{ github.run_number }}
+          path: |
+            config/fast_config.yaml
+            config/fast_config_stats.json
+          retention-days: 7
+      
+      - name: 清理旧的工作流运行记录
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 3
+
+  # 可选：部署到GitHub Pages
+  deploy:
+    needs: speedtest
+    if: needs.speedtest.outputs.changes == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 准备Pages内容
+        run: |
+          mkdir -p public
+          cp config/fast_config.yaml public/clash.yaml
+          cp config/fast_config_stats.json public/stats.json
+          echo "<html><body><h1>Clash Config</h1><p><a href='clash.yaml'>下载配置文件</a></p></body></html>" > public/index.html
+      
+      - name: 上传Pages产物
+        uses: actions/upload-pages-artifact@v2
+        with:
+          path: public
+      
+      - name: 部署到GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v2
